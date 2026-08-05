@@ -29,6 +29,68 @@ var dbiJson: Dbi      # TransTypeJSON   用 (キー: 現在時刻+乱数 = 追�
 var dbiString: Dbi    # TransTypeString 用 (キー: 現在時刻+乱数 = 追記)
 var dbiBinary: Dbi    # TransTypeBinary 用 (キー: 現在時刻+乱数 = 追記)
 
+# リアルタイム配信用の購読登録。REQ を受けたクライアントはここに記録され、
+# 以後に保存されたイベントが PUSH パケットとして即時配信される。
+# (asyncdispatch のシングルスレッドイベントループ上でのみ操作される)
+type Subscription = object
+  subId: string
+  ws: WebSocket
+  req: FodprReq
+var subscriptions: seq[Subscription]
+
+# 特定の WebSocket の購読登録を解除する(切断時)
+proc removeSubs(ws: WebSocket) {.gcsafe.} =
+  {.gcsafe.}:
+    var i = 0
+    while i < subscriptions.len:
+      if subscriptions[i].ws == ws:
+        subscriptions.delete(i)
+      else:
+        inc i
+
+# 保存されたイベントを、購読条件(transType / pubkey)に一致するクライアントへ
+# リアルタイム配信する。購読中クライアントの subId を使った PUSH パケットを作る。
+proc broadcastEvent(event: FodprEvent) {.async, gcsafe.} =
+  # 一致する購読を先に集める(送信中に購読一覧が変わっても影響しないようにコピーする)
+  var targets: seq[tuple[subId: string, ws: WebSocket]]
+  {.gcsafe.}:
+    for sub in subscriptions:
+      if sub.ws.readyState != Open:
+        continue
+      if sub.req.transType != TransTypeAll and sub.req.transType != event.transType:
+        continue
+      if sub.req.tagKey == "pubkey" and sub.req.tagVal != "":
+        if $event.pubkey.toRawCompressed() != sub.req.tagVal:
+          continue
+      targets.add((sub.subId, sub.ws))
+
+  for (subId, ws) in targets:
+    # PUSH パケット: [MsgTypePush(1)] [SubIdLen(2)] [SubId] [encodedEvent]
+    var pushData = ""
+    pushData.add(MsgTypePush)
+    let subIdLen = uint16(subId.len)
+    var siNet: uint16
+    bigEndian16(addr siNet, unsafeAddr subIdLen)
+    var siBytes: array[2, byte]
+    copyMem(addr siBytes[0], addr siNet, 2)
+    pushData.add(char(siBytes[0]))
+    pushData.add(char(siBytes[1]))
+    pushData.add(subId)
+    pushData.add(encodeEvent(event))
+    try:
+      await ws.send(pushData, Binary)
+    except:
+      discard  # 送信失敗は次回の掃除で除去する
+
+  # 閉じた接続の購読登録を掃除する
+  {.gcsafe.}:
+    var i = 0
+    while i < subscriptions.len:
+      if subscriptions[i].ws.readyState != Open:
+        subscriptions.delete(i)
+      else:
+        inc i
+
 # Ctrl+C (SIGINT) を受けたことを記録するフラグ。
 # シグナルハンドラは「シグナル割り込みの中」で実行されるため、
 # ヒープ確保や echo などの操作は禁止されている。
@@ -105,9 +167,10 @@ proc cb(req: Request) {.async, gcsafe.} =
     let isWebSocket = (req.url.path == "/") and req.headers.hasKey("upgrade") and req.headers.getOrDefault("upgrade").toLowerAscii() == "websocket"
 
     if isWebSocket:
+        var ws: WebSocket = nil  # except 節でも購読解除に使うため try の外で宣言する
         try:
             # HTTP リクエストを WebSocket 接続にアップグレード
-            var ws = await newWebSocket(req)
+            ws = await newWebSocket(req)
             echo "[接続] クライアントが接続しました"
 
             # 接続が開いている限りパケットを受信し続ける
@@ -175,6 +238,9 @@ proc cb(req: Request) {.async, gcsafe.} =
                             echo "[保存] イベントを保存しました(TransType: ", transTypeName(event.transType), ")"
                             txn.commit()
 
+                        # 保存したイベントを購読中のクライアントへリアルタイム配信する
+                        await broadcastEvent(event)
+
                         await ws.send("OK: Event accepted")
                     except Exception as e:
                         echo "[エラー] イベントパース失敗: ", e.msg
@@ -206,26 +272,38 @@ proc cb(req: Request) {.async, gcsafe.} =
 
                         # 保存済みイベントの配信が終わったことを通知
                         await ws.send("EOE: End of stored events for " & subReq.subId)
+
+                        # 購読登録: 以後に保存されるイベントをリアルタイム配信する
+                        {.gcsafe.}:
+                            var i = 0
+                            while i < subscriptions.len:
+                                if subscriptions[i].ws == ws and subscriptions[i].subId == subReq.subId:
+                                    subscriptions.delete(i)
+                                else:
+                                    inc i
+                            subscriptions.add(Subscription(subId: subReq.subId, ws: ws, req: subReq))
                     except Exception as e:
                         echo "[エラー] REQ処理失敗: ", e.msg
 
         # クライアントが接続を閉じたときのハンドリング
         except WebSocketClosedError:
             echo "[切断] クライアントが切断しました"
+            removeSubs(ws)
         except Exception as e:
             echo "[エラー] WebSocket例外: ", e.msg
+            removeSubs(ws)
     else:
         if req.url.path == "/":
             await req.respond(Http200, "クライアントから接続してください (Fodpr Relay Server)")
         else:
             await req.respond(Http404, "Not Found")
 
-# サーバーのエントリーポイント。ポート 8000 で WebSocket を待ち受ける。
+# サーバーのエントリーポイント。デフォルトは 8000 番で WebSocket を待ち受ける。
 proc main() {.async.} =
     # LMDB の初期化(起動時に実行)
     initDatabase()
 
-    let port = Port(8000)
+    let port = Port(parseInt(getEnv("FODPR_PORT", "8000")))
     echo "================================================"
     echo " Fodpr Relay Server running on ws://0.0.0.0:", port.int, "/"
     echo " (Ctrl+C で安全に終了できます)"
