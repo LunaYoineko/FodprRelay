@@ -1,0 +1,7 @@
+.git
+data
+bin
+nimble.paths
+nimble.develop
+nimbledeps
+src/server

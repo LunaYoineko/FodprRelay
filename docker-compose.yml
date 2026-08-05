@@ -1,0 +1,12 @@
+services:
+    fodprrelay:
+        build: .
+        container_name: fodprrelay
+        restart: always
+        ports:
+            - "8000:8000"
+        volumes:
+            - fodprrelay-data:/app/fodprrelay/data
+
+volumes:
+    fodprrelay-data:

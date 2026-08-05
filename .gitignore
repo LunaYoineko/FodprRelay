@@ -1,0 +1,8 @@
+/nimble.paths
+/config.nims
+nimble.develop
+nimbledeps
+/data
+/server
+/src/server
+/bin
