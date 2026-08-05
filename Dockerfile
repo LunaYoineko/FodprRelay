@@ -15,7 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends liblmdb0 \
 # ローカルテスト時は FodprRelay.nimble の requires がコメントアウトされているため、
 # ここで明示的に Fodpr をインストールする。
 RUN nimble install -y
-RUN nimble install -y https://github.com/LunaYoineko/Fodpr
 
 # リレーサーバーをリリースビルドする (config.nims のローカルパススイッチは
 # コンテナ内では無効なので、nimble のデフォルトパスで解決する)
