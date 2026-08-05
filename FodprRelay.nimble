@@ -20,4 +20,4 @@ requires "nimcrypto"
 requires "nimSHA2"
 # テスト時は config.nims の switch("path", "/root/Fodpr/src") でローカル参照するため、
 # 以下をコメントアウトしている。公開時はコメントを外すこと。
-# requires "https://github.com/LunaYoineko/Fodpr"
+requires "https://github.com/LunaYoineko/Fodpr"
