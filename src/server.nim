@@ -23,7 +23,7 @@
 import std/atomics
 import std/json
 import asynchttpserver, asyncdispatch, streams, strutils, endians, os, times, random
-import ws
+import ws_limited
 import lmdb
 import nimcrypto
 import nimSHA2
@@ -49,6 +49,8 @@ const
   EncTagLen = 16                # GCM 認証タグの長さ
   EncHeaderLen = 1 + EncNonceLen
   DbKeyLen = 32                 # AES-256 用キー長(バイト)
+  DefaultDbMapSize = uint(256 * 1024 * 1024)  # LMDB マップサイズのデフォルト (256MB, 1GBメモリ環境向け)
+  MaxPacketBytes = 16 * 1024 * 1024           # 受信パケットの上限(ws 側の上限と同じ。OOM 対策)
 
 # 暗号化キー (32 バイト)。起動時に環境変数 / ファイルから読み込む。
 var dbKey: seq[byte]
@@ -256,8 +258,24 @@ proc initDatabase() =
   # 暗号化キーの読み込み(環境変数 > data/db.key > 新規生成)
   dbKey = loadOrCreateDbKey()
   
-  # 環境の作成とオープン(複数のDBIを使うためmaxdbsを指定)
-  dbenv = newLMDBEnv("data", maxdbs = 3)
+  # 環境の作成とオープン(複数のDBIを使うためmaxdbsを指定)。
+  # デフォルトのマップサイズ(1MB)はすぐに上限に達して MDB_BAD_TXN 等で
+  # 書き込みが失敗するため、大きめのサイズを設定する。
+  # 値は環境変数 FODPR_DB_MAPSIZE(バイト) で上書きできる。
+  # (メモリ1GBの小規模環境向けに、既定値は 256MB に抑えている)
+  var newEnv: LMDBEnv
+  let mapSizeEnv = getEnv("FODPR_DB_MAPSIZE", "").strip()
+  let mapSize: uint =
+    if mapSizeEnv.len > 0: uint(parseBiggestInt(mapSizeEnv))
+    else: DefaultDbMapSize
+  if envCreate(addr newEnv) != 0:
+    raise newException(Exception, "LMDB 環境の作成に失敗しました")
+  newEnv.setMaxDBs(3)
+  if envSetMapsize(newEnv, mapSize) != 0:
+    raise newException(Exception, "LMDB マップサイズの設定に失敗しました")
+  if envOpen(newEnv, "data".cstring, 0.cuint, 0o0664) != 0:
+    raise newException(Exception, "LMDB 環境のオープンに失敗しました")
+  dbenv = newEnv
   
   # トランザクションを開始して送信タイプごとのDBIを開く
   let txn = dbenv.newTxn()
@@ -424,6 +442,14 @@ proc cb(req: Request) {.async, gcsafe.} =
                     copyMem(addr packet[0], unsafeAddr packetBytes[0], packetBytes.len)
                 if packet.len == 0:
                     continue  # 空パケットは無視
+
+                # メモリ1GB環境のOOM対策: 上限を超えるパケットは破棄して切断する。
+                # (ws 側でもフレーム受信時に上限チェック済み。ここは二重の防御)
+                if packet.len > MaxPacketBytes:
+                    echo "[拒否] サイズ上限を超えるパケットを受信しました(サイズ: ", packet.len, " bytes)"
+                    await ws.send("ERR: Packet too large")
+                    ws.hangup()
+                    continue
 
                 echo "[受信] バイナリパケット受信(サイズ: ", packet.len, " bytes)"
 

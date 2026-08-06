@@ -11,7 +11,8 @@ bin           = @["server"]
 # Dependencies
 
 requires "nim >= 2.2.10"
-requires "ws"
+# ws ライブラリは src/ws_limited.nim にベンダリングしているため依存しない
+# (受信フレームサイズ上限を入れた OOM 対策版)
 requires "lmdb"
 # Fodpr ライブラリが利用する推移的依存も直接 requires しておく
 # (テスト時は Fodpr をローカル参照するため nimble が解決できない)。

@@ -25,6 +25,9 @@ It receives, stores, and delivers events from clients that communicate over the
 - **Encrypted storage at rest** — values are encrypted with AES-256-GCM (see below)
 - **Event delete API** — only the author of an event can delete it (see below)
 - **Docker support** — start with `docker compose up`
+- **Low-memory / OOM protection** — inbound frame size is capped (16 MB) and the
+  LMDB map size defaults to 256 MB, so the server stays stable even on small
+  1 GB VPS instances (see below)
 - **Graceful shutdown** — press Ctrl+C to close the listener and exit cleanly
 
 ## Requirements
@@ -51,6 +54,13 @@ nimble build
 # start (default: ws://0.0.0.0:8000/)
 ./server
 ```
+
+> **We recommend a release build for production:**
+> ```bash
+> nimble build -d:release
+> ```
+> Thanks to `config.nims`, release builds automatically enable `--opt:size` and
+> disable stack/line tracing for low-memory environments (details below).
 
 Example startup log:
 
@@ -84,6 +94,23 @@ docker compose logs -f
 |----------|---------|-------------|
 | `FODPR_PORT` | `8000` | Port number to listen on |
 | `FODPR_DB_KEY` | (unset) | Encryption key (64 hex chars = 32 bytes) for LMDB values. If unset, `data/db.key` is read; if that is also missing, a key is generated and saved automatically. See "Encrypted storage" below |
+| `FODPR_DB_MAPSIZE` | `268435456` (256 MB) | LMDB map size in bytes — the upper bound for stored data. The default for 1 GB memory environments is 256 MB; override it with this variable when you need more (see "Running on low-memory (1 GB) environments") |
+
+## Running on low-memory (1 GB) environments
+
+The following protections are built in so the server runs on low-memory VPSes
+(e.g. Oracle Cloud Always Free, AMD 1 GB) without worrying about the OOM killer:
+
+- **Lean release builds** — `config.nims` enables `--opt:size` and disables
+  stack/line tracing for release builds, reducing binary size and the memory
+  peak during compilation
+- **Inbound frame cap (16 MB)** — the WebSocket library is vendored as
+  `src/ws_limited.nim` with a frame-length check; frames exceeding the limit are
+  rejected and the connection is closed instead of allocating huge buffers
+- **LMDB map size defaults to 256 MB** — keeps the database from growing past
+  a bound that could pressure physical memory (override via `FODPR_DB_MAPSIZE`)
+
+Measured RSS is about 6-8 MB both at startup and under load.
 
 ## Usage (client)
 
@@ -229,6 +256,12 @@ LMDB keys use the append-style format `evt_<current time>_<transType>_<random>`.
 Since the server never interprets `content`, events are stored as-is in a
 per-type database (json / string / binary).
 
+The LMDB map size (the upper bound for stored data) defaults to **256 MB**.
+When the limit is reached, writes start to fail, so set a large enough value via
+`FODPR_DB_MAPSIZE` if you plan to accumulate data long-term. Note that the map
+size is only a virtual reservation and the file grows on demand, but on a 1 GB
+machine it is safer not to set it much larger than the physical memory.
+
 ## Security notes
 
 - Posting, subscribing, and deleting all work over plain `ws://` as well.
@@ -243,7 +276,8 @@ per-type database (json / string / binary).
 ```
 FodprRelay/
 ├── src/
-│   └── server.nim      # The relay server
+│   ├── server.nim      # The relay server
+│   └── ws_limited.nim  # WebSocket library (vendored, with a 16 MB inbound frame cap)
 ├── FodprRelay.nimble   # Nimble package definition
 ├── config.nims         # Build configuration (for local development)
 ├── Dockerfile          # Docker image definition
