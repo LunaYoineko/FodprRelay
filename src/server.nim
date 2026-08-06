@@ -29,25 +29,8 @@ import nimcrypto
 import nimSHA2
 import Fodpr
 
-# イベント削除 (DEL) 用のメッセージ種別と削除対象タイプ。
+# イベント削除 (DEL) の定義は Fodpr ライブラリ (protocol.nim) に含まれる。
 # 既存の 0x01 (EVENT) / 0x02 (REQ) / 0x81 (PUSH) には影響を与えない追加プロトコル。
-const
-  MsgTypeDel* = char(0x03)     # イベント削除要求 (クライアント → サーバー)
-  DelTargetPubkey* = 0.uint8   # 公開鍵単位で削除 (その送信者のイベントを全削除)
-  DelTargetEvent*  = 1.uint8   # 特定イベントを削除 (createdAt + contentハッシュで特定)
-
-# 削除 (DEL) 要求。
-# 送信者本人だけが自分のイベントを削除できるよう、要求全体に署名を付ける。
-# サーバーは署名を検証し、削除対象イベントの公開鍵が要求の公開鍵と
-# 一致するものだけを削除する。
-type
-  FodprDelReq* = object
-    transType*  : uint16            # 削除対象の送信タイプ (TransTypeAll=0 は全タイプ)
-    targetType* : uint8             # DelTargetPubkey / DelTargetEvent
-    pubkey*     : SkPublicKey       # 削除対象イベントの公開鍵
-    createdAt*  : uint64            # DelTargetEvent のときのみ有効
-    contentHash*: array[32, byte]   # DelTargetEvent のときのみ有効 (content の SHA-256)
-    signature*  : FodprSignature    # 上記フィールド全体に対する署名
 
 # LMDB の環境とデータベースハンドル。
 # サーバーは content の意味 (プロフィール管理など) を一切解釈せず、
@@ -348,69 +331,9 @@ proc pushEventsFromDbi(txn: LMDBTxn, dbi: Dbi, subReq: FodprReq, ws: WebSocket) 
 #   DelTargetPubkey(0) : その pubkey のイベントを transType 単位で全削除
 #   DelTargetEvent(1)  : createdAt と contentHash が一致する特定イベントを削除
 
-# パケット(種別バイト以降)から削除要求を復元する。
-proc decodeDelReq(stream: Stream): FodprDelReq =
-  # transType (uint16, ビッグエンディアン)
-  let ttBytes = stream.readStr(2)
-  var ttNet, ttVal: uint16
-  copyMem(addr ttNet, unsafeAddr ttBytes[0], 2)
-  bigEndian16(addr ttVal, addr ttNet)
-
-  # targetType (1 バイト)
-  let tgtByte = stream.readChar()
-
-  # pubkey (圧縮形式 33 バイト)
-  let pubBytes = stream.readStr(33)
-  var pubArr: array[33, byte]
-  for i in 0..<33: pubArr[i] = byte(pubBytes[i])
-  let pubkey = parsePublicKey(pubArr)
-
-  # 特定イベント削除の場合のみ createdAt と contentHash を読む
-  var createdAt: uint64
-  var contentHash: array[32, byte]
-  if byte(tgtByte) == DelTargetEvent:
-    let caBytes = stream.readStr(8)
-    var caNet, caVal: uint64
-    copyMem(addr caNet, unsafeAddr caBytes[0], 8)
-    bigEndian64(addr caVal, addr caNet)
-    createdAt = caVal
-    let hashBytes = stream.readStr(32)
-    for i in 0..<32: contentHash[i] = byte(hashBytes[i])
-
-  # signature (compact 形式 64 バイト)
-  let sigBytes = stream.readStr(64)
-  var sigArr: array[64, byte]
-  for i in 0..<64: sigArr[i] = byte(sigBytes[i])
-  let signature = FodprSignature(sig: parseSignature(sigArr))
-
-  result = FodprDelReq(
-    transType: ttVal,
-    targetType: byte(tgtByte),
-    pubkey: pubkey,
-    createdAt: createdAt,
-    contentHash: contentHash,
-    signature: signature
-  )
-
-# 署名対象のバイト列を作成する。クライアント側とバイト列を完全に一致させる必要がある。
-proc buildDelSignedData(req: FodprDelReq): string =
-  # transType(2) | targetType(1) | pubkey(33) | [createdAt(8) | contentHash(32)]
-  var ttNet: uint16
-  bigEndian16(addr ttNet, unsafeAddr req.transType)
-  var ttBytes: array[2, byte]
-  copyMem(addr ttBytes[0], addr ttNet, 2)
-  result.add(char(ttBytes[0]))
-  result.add(char(ttBytes[1]))
-  result.add(char(req.targetType))
-  let pubRaw = req.pubkey.toRawCompressed()
-  for b in pubRaw: result.add(char(b))
-  if req.targetType == DelTargetEvent:
-    var caNet: uint64
-    bigEndian64(addr caNet, unsafeAddr req.createdAt)
-    var caBytes: array[8, byte]
-    copyMem(addr caBytes[0], addr caNet, 8)
-    for b in caBytes: result.add(char(b))
-    for b in req.contentHash: result.add(char(b))
+# パケット(種別バイト以降)から削除要求を復元する処理と、署名対象バイト列の
+# 生成は Fodpr ライブラリ (protocol.nim の decodeDelReq / encodeDelSignedData) が
+# 提供している。サーバー側はその型・関数を使って削除処理のみを実装する。
 
 # 指定 DBI から削除条件に一致するイベントを削除し、削除件数を返す。
 # 削除条件: イベントの公開鍵が要求の公開鍵と一致し、
@@ -627,7 +550,7 @@ proc cb(req: Request) {.async, gcsafe.} =
                             continue
 
                         # 署名を検証する。送信者本人だけが自分のイベントを削除できる。
-                        if not verifyContent(delReq.pubkey, buildDelSignedData(delReq), delReq.signature):
+                        if not verifyContent(delReq.pubkey, encodeDelSignedData(delReq), delReq.signature):
                             echo "[拒否] 不正な署名の削除要求を検知しました"
                             await ws.send("ERR: Invalid signature")
                             continue

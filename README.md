@@ -109,7 +109,7 @@ Fodpr プロトコルの定義（EVENT / REQ / PUSH のエンコード・デコ�
 |----|------|------|------|
 | `0x01` | EVENT | クライアント → サーバー | 署名付きイベントの投稿 |
 | `0x02` | REQ   | クライアント → サーバー | 購読要求 |
-| `0x03` | DEL   | クライアント → サーバー | イベント削除要求（このサーバーが追加） |
+| `0x03` | DEL   | クライアント → サーバー | イベント削除要求 |
 | `0x81` | PUSH  | サーバー → クライアント | イベント配信 |
 
 ### EVENT パケット（0x01）
@@ -143,7 +143,9 @@ MsgTypePush(1) | subIdLen(2) | subId | EVENT本体
 
 ### DEL パケット（0x03）— イベント削除 API
 
-このサーバーが独自に追加した拡張です。既存の EVENT / REQ / PUSH には影響しません。
+DEL の定義（定数・型・エンコード/デコード）は [Fodpr ライブラリ](https://github.com/LunaYoineko/Fodpr)
+の protocol.nim に含まれており、このサーバーはそれを使って削除処理を実装しています。
+既存の EVENT / REQ / PUSH には影響しません。
 
 ```
 MsgTypeDel(1) | transType(2) | targetType(1) | pubkey(33)

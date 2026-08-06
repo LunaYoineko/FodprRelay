@@ -110,7 +110,7 @@ The Fodpr protocol definitions (EVENT / REQ / PUSH encode/decode) live in the
 |-------|------|-----------|-------------|
 | `0x01` | EVENT | client → server | Post a signed event |
 | `0x02` | REQ   | client → server | Subscription request |
-| `0x03` | DEL   | client → server | Delete-events request (added by this server) |
+| `0x03` | DEL   | client → server | Delete-events request |
 | `0x81` | PUSH  | server → client | Event delivery |
 
 ### EVENT packet (0x01)
@@ -144,7 +144,9 @@ MsgTypePush(1) | subIdLen(2) | subId | EVENT payload
 
 ### DEL packet (0x03) — event delete API
 
-This is an extension added by this server. It does not affect the existing
+The DEL definitions (constants, types, encode/decode) live in the
+[Fodpr library](https://github.com/LunaYoineko/Fodpr)'s protocol.nim, and this
+server uses them to implement the delete logic. It does not affect the existing
 EVENT / REQ / PUSH messages.
 
 ```
