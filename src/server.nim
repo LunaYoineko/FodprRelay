@@ -39,6 +39,8 @@ var dbenv: LMDBEnv
 var dbiJson: Dbi      # TransTypeJSON   用 (キー: 現在時刻+乱数 = 追記)
 var dbiString: Dbi    # TransTypeString 用 (キー: 現在時刻+乱数 = 追記)
 var dbiBinary: Dbi    # TransTypeBinary 用 (キー: 現在時刻+乱数 = 追記)
+var dbiSigned: Dbi    # TransTypeSigned 用 (全体署名イベント)
+var dbiEncrypted: Dbi # TransTypeEncrypted 用 (宛先別暗号化エンベロープ)
 
 # LMDB 保存値の暗号化設定。
 # 保存形式: バージョン(1バイト) | nonce(12バイト) | 暗号文 | 認証タグ(16バイト)
@@ -74,6 +76,86 @@ proc removeSubs(ws: WebSocket) {.gcsafe.} =
       else:
         inc i
 
+# ---------------------------------------------------------------------------
+# 読取認証 (AUTH, NIP-42 相当) の状態管理
+# ---------------------------------------------------------------------------
+# 宛先限定イベント (tags に "to:<fpub>" を持つ) は、宛先本人として認証された
+# 購読にのみ配信する (メールボックスモデル)。認証フロー:
+#   1. クライアントが tagKey="to" の REQ を送る
+#   2. サーバーは未認証ならチャレンジ nonce を送る (MsgTypeChallenge)
+#   3. クライアントは nonce に署名して AUTH を送る (MsgTypeAuth)
+#   4. サーバーは署名を検証し、接続を認証済みとして REQ を再開する
+type
+  AuthedConn* = object
+    ws*: WebSocket
+    pubkeyFpub*: string   # 小文字化した fpub1... (to: タグとの比較用)
+
+  PendingAuth* = object
+    ws*: WebSocket
+    nonce*: array[32, byte]
+    createdAt*: float     # epochTime (チャレンジ TTL 判定用)
+    pendingReq*: FodprReq # 認証後に再開する REQ (未設定なら subId が空)
+
+var authedKeys: seq[AuthedConn]
+var pendingAuths: seq[PendingAuth]
+
+# 認証情報とチャレンジ情報を WebSocket ごとに削除する (切断時)
+proc removeAuth(ws: WebSocket) {.gcsafe.} =
+  {.gcsafe.}:
+    var i = 0
+    while i < authedKeys.len:
+      if authedKeys[i].ws == ws:
+        authedKeys.delete(i)
+      else:
+        inc i
+    i = 0
+    while i < pendingAuths.len:
+      if pendingAuths[i].ws == ws:
+        pendingAuths.delete(i)
+      else:
+        inc i
+
+# 接続が指定の fpub として認証済みか判定する。
+proc isAuthedAs(ws: WebSocket, fpubLower: string): bool =
+  {.gcsafe.}:
+    for a in authedKeys:
+      if a.ws == ws and a.pubkeyFpub == fpubLower:
+        return true
+  return false
+
+# イベントのタグから宛先リスト (to:<fpub>) を取り出す (小文字化して返す)。
+proc toRecipients(ev: FodprEvent): seq[string] =
+  for t in ev.tags:
+    if t.len > 3 and t[0..2] == "to:":
+      result.add(t[3..^1].toLowerAscii())
+
+# REQ のタグ条件 (tagKey/tagVal) にイベントが一致するか判定する。
+#   tagKey="pubkey" : 送信者の公開鍵 (33バイト圧縮のバイト列) と比較
+#   tagKey="to"     : イベントの to:<fpub> タグに宛先が含まれるか比較
+#   tagKey=""       : 条件なし (全イベント一致)
+proc eventMatchesReq(evt: FodprEvent, req: FodprReq): bool =
+  if req.tagKey == "pubkey" and req.tagVal != "":
+    if $evt.pubkey.toRawCompressed() != req.tagVal:
+      return false
+  elif req.tagKey == "to" and req.tagVal != "":
+    if req.tagVal.toLowerAscii() notin toRecipients(evt):
+      return false
+  return true
+
+# イベントがこの購読者 (接続 + REQ) から読めるか判定する。
+# プライバシールール: `to:<fpub>` タグ付きイベントは、宛先本人として認証された
+# 購読にのみ配信する。公開イベント (to: タグなし) は通常のタグ条件で照合する。
+proc eventVisibleTo(evt: FodprEvent, req: FodprReq, ws: WebSocket): bool =
+  let recipients = toRecipients(evt)
+  if recipients.len > 0:
+    # 宛先限定イベント: 購読者の認証鍵が宛先に含まれている必要がある
+    if req.tagKey != "to" or req.tagVal == "":
+      return false
+    if req.tagVal.toLowerAscii() notin recipients:
+      return false
+    return isAuthedAs(ws, req.tagVal.toLowerAscii())
+  return eventMatchesReq(evt, req)
+
 # 保存されたイベントを、購読条件(transType / pubkey)に一致するクライアントへ
 # リアルタイム配信する。購読中クライアントの subId を使った PUSH パケットを作る。
 proc broadcastEvent(event: FodprEvent) {.async, gcsafe.} =
@@ -85,9 +167,9 @@ proc broadcastEvent(event: FodprEvent) {.async, gcsafe.} =
         continue
       if sub.req.transType != TransTypeAll and sub.req.transType != event.transType:
         continue
-      if sub.req.tagKey == "pubkey" and sub.req.tagVal != "":
-        if $event.pubkey.toRawCompressed() != sub.req.tagVal:
-          continue
+      # タグ条件 + プライバシー (to: 宛先限定イベントは認証済み宛先のみ)
+      if not eventVisibleTo(event, sub.req, sub.ws):
+        continue
       targets.add((sub.subId, sub.ws))
 
   for (subId, ws) in targets:
@@ -219,7 +301,7 @@ proc decryptValue(blob: string): string =
 proc migrateLegacyData() =
   let txn = dbenv.newTxn()
   var migrated = 0
-  for dbi in [dbiJson, dbiString, dbiBinary]:
+  for dbi in [dbiJson, dbiString, dbiBinary, dbiSigned, dbiEncrypted]:
     # 1) カーソルで平文レコードを集める(カーソル反復中の書換えを避ける)
     var plainRecords: seq[tuple[key: string, value: string]]
     let cursor = txn.cursorOpen(dbi)
@@ -270,7 +352,7 @@ proc initDatabase() =
     else: DefaultDbMapSize
   if envCreate(addr newEnv) != 0:
     raise newException(Exception, "LMDB 環境の作成に失敗しました")
-  newEnv.setMaxDBs(3)
+  newEnv.setMaxDBs(5)
   if envSetMapsize(newEnv, mapSize) != 0:
     raise newException(Exception, "LMDB マップサイズの設定に失敗しました")
   if envOpen(newEnv, "data".cstring, 0.cuint, 0o0664) != 0:
@@ -282,6 +364,8 @@ proc initDatabase() =
   dbiJson = txn.dbiOpen("json", CREATE)
   dbiString = txn.dbiOpen("string", CREATE)
   dbiBinary = txn.dbiOpen("binary", CREATE)
+  dbiSigned = txn.dbiOpen("signed", CREATE)
+  dbiEncrypted = txn.dbiOpen("encrypted", CREATE)
   txn.commit()
 
   # 旧バージョンの平文データを暗号化に変換する
@@ -311,11 +395,10 @@ proc pushEventsFromDbi(txn: LMDBTxn, dbi: Dbi, subReq: FodprReq, ws: WebSocket) 
         if encoded.len == 0:
             continue
 
-        # pubkey タグによる絞り込み (イベントをデコードして公開鍵を比較)
-        if subReq.tagKey == "pubkey" and subReq.tagVal != "":
-            let evt = decodeEvent(newStringStream(encoded))
-            if $evt.pubkey.toRawCompressed() != subReq.tagVal:
-                continue
+        # タグ条件 + プライバシー (to: 宛先限定) による絞り込み
+        let evt = decodeEvent(newStringStream(encoded))
+        if not eventVisibleTo(evt, subReq, ws):
+            continue
 
         # PUSH パケット作成・送信
         var pushData = ""
@@ -338,16 +421,19 @@ proc pushEventsFromDbi(txn: LMDBTxn, dbi: Dbi, subReq: FodprReq, ws: WebSocket) 
 # ---------------------------------------------------------------------------
 # パケット形式 (クライアント → サーバー):
 #   msgType(1) | transType(2) | targetType(1) | pubkey(33) |
-#   [createdAt(8) | contentHash(32)] | signature(64)
+#   [createdAt(8) | contentHash(32)]  ← DelTargetEvent の場合
+#   [eventId(32)]                     ← DelTargetEventId の場合
+#   | signature(64)
 #
 # 署名対象 (transType 以降、signature を除いたバイト列):
-#   transType(2) | targetType(1) | pubkey(33) | [createdAt(8) | contentHash(32)]
+#   transType(2) | targetType(1) | pubkey(33) | 識別子部分
 # 署名は送信者本人の秘密鍵で行い、サーバーは要求内の pubkey で検証する。
 # これにより「自分の投稿だけを自分が消せる」ことを保証する。
 #
 # targetType による削除対象の違い:
-#   DelTargetPubkey(0) : その pubkey のイベントを transType 単位で全削除
-#   DelTargetEvent(1)  : createdAt と contentHash が一致する特定イベントを削除
+#   DelTargetPubkey(0)  : その pubkey のイベントを transType 単位で全削除
+#   DelTargetEvent(1)   : createdAt と contentHash が一致する特定イベントを削除
+#   DelTargetEventId(2) : eventId が一致する特定イベントを削除
 
 # パケット(種別バイト以降)から削除要求を復元する処理と、署名対象バイト列の
 # 生成は Fodpr ライブラリ (protocol.nim の decodeDelReq / encodeDelSignedData) が
@@ -382,6 +468,10 @@ proc deleteEventsFromDbi(txn: LMDBTxn, dbi: Dbi, delReq: FodprDelReq, targetPubk
                 continue
             if computeSHA256(evt.content) != delReq.contentHash:
                 continue
+        elif delReq.targetType == DelTargetEventId:
+            # eventId (署名対象バイト列の SHA-256) で照合する
+            if eventId(evt) != delReq.eventId:
+                continue
 
         # 削除するキーをコピーしてからカーソル位置のレコードを削除する
         # (mdb_cursor_del 後は MDB_NEXT で次のレコードに進める)
@@ -408,16 +498,72 @@ proc deleteEvents(delReq: FodprDelReq): int =
                 result += deleteEventsFromDbi(txn, dbiString, delReq, targetPubkey)
             of TransTypeBinary:
                 result += deleteEventsFromDbi(txn, dbiBinary, delReq, targetPubkey)
+            of TransTypeSigned:
+                result += deleteEventsFromDbi(txn, dbiSigned, delReq, targetPubkey)
+            of TransTypeEncrypted:
+                result += deleteEventsFromDbi(txn, dbiEncrypted, delReq, targetPubkey)
             of TransTypeAll:
                 result += deleteEventsFromDbi(txn, dbiJson, delReq, targetPubkey)
                 result += deleteEventsFromDbi(txn, dbiString, delReq, targetPubkey)
                 result += deleteEventsFromDbi(txn, dbiBinary, delReq, targetPubkey)
+                result += deleteEventsFromDbi(txn, dbiSigned, delReq, targetPubkey)
+                result += deleteEventsFromDbi(txn, dbiEncrypted, delReq, targetPubkey)
             else:
                 discard  # 未定義の transType はハンドラ側で拒否済み
             txn.commit()
         except:
             txn.abort()
             raise
+
+# 購読要求 (REQ) の処理本体。保存済みイベントの配信とリアルタイム購読の登録を行う。
+# 認証フロー (チャレンジ → AUTH) の完了後に呼ばれることもある。
+proc handleReq(ws: WebSocket, subReq: FodprReq) {.async, gcsafe.} =
+    # タグ条件の検証 (未知の tagKey は拒否する)
+    if subReq.tagKey != "" and subReq.tagKey != "pubkey" and subReq.tagKey != "to":
+        await ws.send("ERR: Unknown tag key")
+        return
+    if subReq.tagKey == "to" and subReq.tagVal == "":
+        await ws.send("ERR: Missing tag value")
+        return
+
+    echo "[購読] サブスクリプション要求受領 [ID: ", subReq.subId, "] (TransType: ", transTypeName(subReq.transType), " tagKey: ", subReq.tagKey, ")"
+
+    # 保存済みイベントから transType に一致するものを PUSH 配信する
+    {.gcsafe.}:
+        let txn = dbenv.newTxn()
+
+        case subReq.transType
+        of TransTypeJSON:
+            await pushEventsFromDbi(txn, dbiJson, subReq, ws)
+        of TransTypeString:
+            await pushEventsFromDbi(txn, dbiString, subReq, ws)
+        of TransTypeBinary:
+            await pushEventsFromDbi(txn, dbiBinary, subReq, ws)
+        of TransTypeSigned:
+            await pushEventsFromDbi(txn, dbiSigned, subReq, ws)
+        of TransTypeEncrypted:
+            await pushEventsFromDbi(txn, dbiEncrypted, subReq, ws)
+        else:
+            # TransTypeAll: すべてのタイプを順番に配信する
+            await pushEventsFromDbi(txn, dbiJson, subReq, ws)
+            await pushEventsFromDbi(txn, dbiString, subReq, ws)
+            await pushEventsFromDbi(txn, dbiBinary, subReq, ws)
+            await pushEventsFromDbi(txn, dbiSigned, subReq, ws)
+            await pushEventsFromDbi(txn, dbiEncrypted, subReq, ws)
+        txn.commit()
+
+    # 保存済みイベントの配信が終わったことを通知
+    await ws.send("EOE: End of stored events for " & subReq.subId)
+
+    # 購読登録: 以後に保存されるイベントをリアルタイム配信する
+    {.gcsafe.}:
+        var i = 0
+        while i < subscriptions.len:
+            if subscriptions[i].ws == ws and subscriptions[i].subId == subReq.subId:
+                subscriptions.delete(i)
+            else:
+                inc i
+        subscriptions.add(Subscription(subId: subReq.subId, ws: ws, req: subReq))
 
 # 各 HTTP リクエストを処理するコールバック。
 # URL が "/" (ルートパス) で WebSocket アップグレードヘッダがあるときだけ
@@ -464,7 +610,17 @@ proc cb(req: Request) {.async, gcsafe.} =
                         let event = decodeEvent(strm)
 
                         # 署名を検証する。偽装・改ざんされたイベントは拒否する。
-                        if not verifyContent(event.pubkey, event.content, event.signature):
+                        #  - TransTypeSigned / TransTypeEncrypted (全体署名):
+                        #    createdAt / pubkey / tags を含む全フィールドに対して検証する
+                        #  - 既存タイプ (1〜3): 後方互換のため content のみ署名を検証する
+                        let isFullSig = event.transType == TransTypeSigned or
+                                        event.transType == TransTypeEncrypted
+                        let sigValid =
+                            if isFullSig:
+                                verifyEvent(event.pubkey, event, event.signature)
+                            else:
+                                verifyContent(event.pubkey, event.content, event.signature)
+                        if not sigValid:
                             echo "[拒否] 不正な署名のイベントを検知しました"
                             await ws.send("ERR: Invalid signature")
                             continue
@@ -472,10 +628,53 @@ proc cb(req: Request) {.async, gcsafe.} =
                         # 未定義の送信タイプは拒否する
                         if event.transType != TransTypeJSON and
                            event.transType != TransTypeString and
-                           event.transType != TransTypeBinary:
+                           event.transType != TransTypeBinary and
+                           event.transType != TransTypeSigned and
+                           event.transType != TransTypeEncrypted:
                             echo "[拒否] 未定義の送信タイプです: ", event.transType
                             await ws.send("ERR: Unknown trans type")
                             continue
+
+                        # TransTypeEncrypted: エンベロープ構造と to: タグの一致を検証する
+                        # (内容は復号しない。to: タグがエンベロープ内の受信者と対応して
+                        #  いることを確認し、「読めない人への配送」を防ぐ)
+                        if event.transType == TransTypeEncrypted:
+                            if not isValidEnvelope(event.content):
+                                echo "[拒否] 不正な暗号化エンベロープです"
+                                await ws.send("ERR: Invalid envelope")
+                                continue
+                            var encRecips: seq[string]
+                            try:
+                                for pub in envelopeRecipients(event.content):
+                                    encRecips.add($pub.toRawCompressed())
+                            except EnvelopeError:
+                                echo "[拒否] エンベロープの受信者を抽出できません"
+                                await ws.send("ERR: Invalid envelope")
+                                continue
+                            # to:<fpub> タグがエンベロープ内の受信者と一致することを確認
+                            var toCount = 0
+                            var toValid = true
+                            for t in event.tags:
+                                if t.len > 3 and t[0..2] == "to:":
+                                    inc toCount
+                                    try:
+                                        let toPub = fpubDecode(t[3..^1])
+                                        if $toPub.toRawCompressed() notin encRecips:
+                                            toValid = false
+                                            echo "[拒否] to: タグがエンベロープの受信者と一致しません"
+                                            await ws.send("ERR: to: tag not in envelope recipients")
+                                            break
+                                    except:
+                                        toValid = false
+                                        echo "[拒否] to: タグの fpub が不正です"
+                                        await ws.send("ERR: Invalid to: tag")
+                                        break
+                            if not toValid:
+                                continue
+                            if toCount == 0:
+                                echo "[拒否] 暗号化イベントには to: タグが必須です"
+                                await ws.send("ERR: Encrypted event requires to: tag")
+                                continue
 
                         # JSON タイプは content が正しい JSON であることを検証する
                         if event.transType == TransTypeJSON:
@@ -503,6 +702,10 @@ proc cb(req: Request) {.async, gcsafe.} =
                                 txn.put(dbiJson, timeKey, encrypted)
                             of TransTypeString:
                                 txn.put(dbiString, timeKey, encrypted)
+                            of TransTypeSigned:
+                                txn.put(dbiSigned, timeKey, encrypted)
+                            of TransTypeEncrypted:
+                                txn.put(dbiEncrypted, timeKey, encrypted)
                             else:
                                 txn.put(dbiBinary, timeKey, encrypted)
                             echo "[保存] イベントを保存しました(TransType: ", transTypeName(event.transType), ")"
@@ -520,40 +723,83 @@ proc cb(req: Request) {.async, gcsafe.} =
                 elif msgType == MsgTypeReq:
                     try:
                         let subReq = decodeReq(strm)
-                        echo "[購読] サブスクリプション要求受領 [ID: ", subReq.subId, "] (TransType: ", transTypeName(subReq.transType), ")"
 
-                        # 保存済みイベントから transType に一致するものを PUSH 配信する
-                        {.gcsafe.}:
-                            let txn = dbenv.newTxn()
+                        # 宛先限定 (tagKey="to") の購読は認証が必要。
+                        # 未認証ならチャレンジを発行し、REQ は認証後に再開する。
+                        if subReq.tagKey == "to" and subReq.tagVal != "":
+                            if not isAuthedAs(ws, subReq.tagVal.toLowerAscii()):
+                                var nonce: array[32, byte]
+                                discard randomBytes(nonce)
+                                {.gcsafe.}:
+                                    var i = 0
+                                    while i < pendingAuths.len:
+                                        if pendingAuths[i].ws == ws:
+                                            pendingAuths.delete(i)
+                                        else:
+                                            inc i
+                                    pendingAuths.add(PendingAuth(
+                                        ws: ws, nonce: nonce,
+                                        createdAt: epochTime(), pendingReq: subReq))
+                                await ws.send(encodeChallenge(nonce), Binary)
+                                echo "[認証] チャレンジを送信しました (REQ: ", subReq.subId, ")"
+                                continue
 
-                            case subReq.transType
-                            of TransTypeJSON:
-                                await pushEventsFromDbi(txn, dbiJson, subReq, ws)
-                            of TransTypeString:
-                                await pushEventsFromDbi(txn, dbiString, subReq, ws)
-                            of TransTypeBinary:
-                                await pushEventsFromDbi(txn, dbiBinary, subReq, ws)
-                            else:
-                                # TransTypeAll: すべてのタイプを順番に配信する
-                                await pushEventsFromDbi(txn, dbiJson, subReq, ws)
-                                await pushEventsFromDbi(txn, dbiString, subReq, ws)
-                                await pushEventsFromDbi(txn, dbiBinary, subReq, ws)
-                            txn.commit()
-
-                        # 保存済みイベントの配信が終わったことを通知
-                        await ws.send("EOE: End of stored events for " & subReq.subId)
-
-                        # 購読登録: 以後に保存されるイベントをリアルタイム配信する
-                        {.gcsafe.}:
-                            var i = 0
-                            while i < subscriptions.len:
-                                if subscriptions[i].ws == ws and subscriptions[i].subId == subReq.subId:
-                                    subscriptions.delete(i)
-                                else:
-                                    inc i
-                            subscriptions.add(Subscription(subId: subReq.subId, ws: ws, req: subReq))
+                        await handleReq(ws, subReq)
                     except Exception as e:
                         echo "[エラー] REQ処理失敗: ", e.msg
+                        await ws.send("ERR: Invalid request")
+
+                # --- 認証応答 (AUTH) の処理 ---
+                elif msgType == MsgTypeAuth:
+                    try:
+                        let auth = decodeAuth(strm)
+
+                        # 発行済みチャレンジを探す (接続 + nonce 一致)
+                        var found = -1
+                        {.gcsafe.}:
+                            for i in 0..<pendingAuths.len:
+                                if pendingAuths[i].ws == ws and pendingAuths[i].nonce == auth.nonce:
+                                    found = i
+                                    break
+                        if found == -1:
+                            await ws.send("ERR: Invalid or expired challenge")
+                            continue
+
+                        # TTL チェック (発行から 60 秒以内)
+                        var challengeAge = 0.0
+                        {.gcsafe.}: challengeAge = epochTime() - pendingAuths[found].createdAt
+                        if challengeAge > 60.0:
+                            {.gcsafe.}: pendingAuths.delete(found)
+                            await ws.send("ERR: Challenge expired")
+                            continue
+
+                        # 署名検証: nonce(32) | pubkey(33) に対する署名
+                        if not verifyContent(auth.pubkey, encodeAuthSignedData(auth), auth.signature):
+                            {.gcsafe.}: pendingAuths.delete(found)
+                            await ws.send("ERR: Invalid auth signature")
+                            continue
+
+                        # 認証成功。保留していた REQ を再開する。
+                        var pendingReq = FodprReq(subId: "", transType: 0, tagKey: "", tagVal: "")
+                        {.gcsafe.}: pendingReq = pendingAuths[found].pendingReq
+                        let fpub = fpubEncode(auth.pubkey).toLowerAscii()
+                        {.gcsafe.}:
+                            var i = 0
+                            while i < authedKeys.len:
+                                if authedKeys[i].ws == ws:
+                                    authedKeys.delete(i)
+                                else:
+                                    inc i
+                            authedKeys.add(AuthedConn(ws: ws, pubkeyFpub: fpub))
+                            pendingAuths.delete(found)
+                        echo "[認証] 接続を認証しました (fpub: ", fpub[0..<12], "...)"
+                        await ws.send("OK: Authenticated")
+
+                        if pendingReq.subId != "":
+                            await handleReq(ws, pendingReq)
+                    except Exception as e:
+                        echo "[エラー] AUTH処理失敗: ", e.msg
+                        await ws.send("ERR: Invalid auth")
 
                 # --- イベント削除 (DEL) の処理 ---
                 elif msgType == MsgTypeDel:
@@ -564,13 +810,17 @@ proc cb(req: Request) {.async, gcsafe.} =
                         if delReq.transType != TransTypeAll and
                            delReq.transType != TransTypeJSON and
                            delReq.transType != TransTypeString and
-                           delReq.transType != TransTypeBinary:
+                           delReq.transType != TransTypeBinary and
+                           delReq.transType != TransTypeSigned and
+                           delReq.transType != TransTypeEncrypted:
                             echo "[拒否] 未定義の送信タイプの削除要求です: ", delReq.transType
                             await ws.send("ERR: Unknown trans type")
                             continue
 
                         # 未定義の削除対象タイプは拒否する
-                        if delReq.targetType != DelTargetPubkey and delReq.targetType != DelTargetEvent:
+                        if delReq.targetType != DelTargetPubkey and
+                           delReq.targetType != DelTargetEvent and
+                           delReq.targetType != DelTargetEventId:
                             echo "[拒否] 未定義の削除対象タイプです: ", delReq.targetType
                             await ws.send("ERR: Unknown target type")
                             continue
@@ -593,9 +843,11 @@ proc cb(req: Request) {.async, gcsafe.} =
         except WebSocketClosedError:
             echo "[切断] クライアントが切断しました"
             removeSubs(ws)
+            removeAuth(ws)
         except Exception as e:
             echo "[エラー] WebSocket例外: ", e.msg
             removeSubs(ws)
+            removeAuth(ws)
     else:
         if req.url.path == "/":
             await req.respond(Http200, "クライアントから接続してください (Fodpr Relay Server)")

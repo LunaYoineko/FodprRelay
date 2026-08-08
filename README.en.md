@@ -17,10 +17,18 @@ It receives, stores, and delivers events from clients that communicate over the
 
 ## Features
 
-- **Signature-verified storage** — every event is verified with secp256k1 (ECDSA) before saving
+- **Signature-verified storage** — every event is verified with secp256k1 (ECDSA)
+  before saving (Signed / Encrypted events are verified over all fields)
 - **Real-time delivery** — events are pushed instantly to clients subscribed via REQ
-- **Transmission types (TransType)** — JSON / String / Binary. The server never
-  interprets the semantics of `content`; it only stores and delivers based on the type
+- **Transmission types (TransType)** — JSON / String / Binary / Signed / Encrypted.
+  The server never interprets the semantics of `content`; it only stores and
+  delivers based on the type
+- **Recipient-limited privacy delivery** — events with a `to:<fpub>` tag are
+  delivered only to subscriptions authenticated as that recipient via AUTH
+  (read authentication, NIP-42 equivalent)
+- **Encrypted-event structure validation** — TransTypeEncrypted envelopes are
+  validated for structure and `to:` tag consistency without being decrypted
+  (the server cannot read them)
 - **Persistent LMDB storage** — data survives server restarts
 - **Encrypted storage at rest** — values are encrypted with AES-256-GCM (see below)
 - **Event delete API** — only the author of an event can delete it (see below)
@@ -138,7 +146,9 @@ The Fodpr protocol definitions (EVENT / REQ / PUSH encode/decode) live in the
 | `0x01` | EVENT | client → server | Post a signed event |
 | `0x02` | REQ   | client → server | Subscription request |
 | `0x03` | DEL   | client → server | Delete-events request |
+| `0x04` | AUTH  | client → server | Read-authentication signature response (NIP-42 equivalent) |
 | `0x81` | PUSH  | server → client | Event delivery |
+| `0x82` | CHALLENGE | server → client | Authentication challenge (32-byte nonce) |
 
 ### EVENT packet (0x01)
 
@@ -147,12 +157,14 @@ transType(2) | createdAt(8) | pubkey(33) | tagCount(2)
 | (tagLen(2) | tag) × tagCount | contentLen(4) | content | signature(64)
 ```
 
-- `transType` — transmission type (uint16: 1 = JSON, 2 = String, 3 = Binary)
+- `transType` — transmission type (uint16: 0=All (REQ only), 1=JSON, 2=String, 3=Binary, 4=Signed, 5=Encrypted)
 - `createdAt` — Unix timestamp in seconds (uint64)
 - `pubkey` — sender's public key (compressed, 33 bytes)
 - `tags` — list of tag strings
-- `content` — body (JSON, string, or binary depending on the type)
-- `signature` — ECDSA signature over the SHA-256 digest of `content` (64 bytes)
+- `content` — body (JSON, string, binary, or envelope depending on the type)
+- `signature` — ECDSA signature (64 bytes)
+  - TransType 1–3: over the SHA-256 digest of `content`
+  - TransType 4–5: over all fields including `createdAt`, `pubkey`, and `tags`
 
 ### REQ packet (0x02)
 
@@ -161,7 +173,60 @@ MsgTypeReq(1) | subIdLen(2) | subId | transType(2) | tagKeyLen(2) | tagKey | tag
 ```
 
 - `transType=0` (TransTypeAll) subscribes to all types
-- Filtering by tag is supported (`tagKey="pubkey"` filters by public key)
+- Filtering by tag is supported:
+  - `tagKey="pubkey"` — filter by sender (public key)
+  - `tagKey="to"` — filter by recipient. `to:` recipient-limited events are
+    delivered only to subscriptions authenticated as that recipient (see AUTH below)
+
+### Read authentication (AUTH / CHALLENGE, NIP-42 equivalent)
+
+Events with a `to:<fpub>` tag (recipient-limited) are only delivered to that
+recipient, so the relay runs a challenge authentication.
+
+```
+1. client   → REQ(subId, tagKey="to", tagVal=fpub)
+2. server   → CHALLENGE (0x82): nonce(32)
+3. client   → AUTH (0x04): nonce(32) | pubkey(33) | signature(64)
+4. server   → delivers `to:` recipient-limited events only to authenticated subscriptions
+```
+
+- The bytes signed in `AUTH` are `nonce(32) | pubkey(33)`
+- Only subscriptions that pass authentication receive recipient-limited events
+- Public events (no `to:` tag) remain available without authentication
+- Subscriptions that fail authentication are not given recipient-limited events
+  (their existence is not revealed either)
+
+### TransTypeEncrypted (encrypted-event) validation on receive
+
+The `content` of TransTypeEncrypted is a **per-recipient encrypted envelope**
+(gift-wrap equivalent) built by the sender with
+[Fodpr's envelope.nim](https://github.com/LunaYoineko/Fodpr/blob/main/src/envelope.nim).
+The relay does **not** decrypt the body; it validates only the structure.
+
+On receive the relay verifies:
+
+1. At least one `to:` tag is present
+2. The `to:` tags (fpub form) match the recipients inside the envelope
+3. The full-event signature verifies with the sender's public key
+
+This prevents "delivery to someone not on the recipient list" and "forged
+recipients" while keeping the **content unreadable to the server** (E2EE).
+
+Decryption happens on the recipient's client:
+
+```nim
+let body = decryptEnvelope(ev.content, myPriv, ev.pubkey)  # Fodpr.envelope
+```
+
+### Tag conventions
+
+Tags are strings in `"<key>:<value>"` form.
+
+| Tag | Description |
+|-----|-------------|
+| `to:<fpub>` | Recipient's public key. Required for recipient-limited events (especially Encrypted) |
+| `p:<fpub>` | Participant's public key (for reference) |
+| `e:<eventId>` | Referenced event (reply-to / thread linking) |
 
 ### PUSH packet (0x81)
 
@@ -178,22 +243,23 @@ EVENT / REQ / PUSH messages.
 
 ```
 MsgTypeDel(1) | transType(2) | targetType(1) | pubkey(33)
-| [createdAt(8) | contentHash(32)] | signature(64)
+| [createdAt(8) | contentHash(32)] | [eventId(32)] | signature(64)
 ```
 
 **Signed data** (the bytes below, excluding `signature`):
 
 ```
-transType(2) | targetType(1) | pubkey(33) | [createdAt(8) | contentHash(32)]
+transType(2) | targetType(1) | pubkey(33) | [createdAt(8) | contentHash(32)] | [eventId(32)]
 ```
 
 | Field | Description |
 |-------|-------------|
-| `transType` | Transmission type of the target events (`0` = all, `1` = JSON, `2` = String, `3` = Binary) |
+| `transType` | Transmission type of the target events (`0` = all, `1` = JSON, `2` = String, `3` = Binary, `4` = Signed, `5` = Encrypted) |
 | `targetType` | How to select the target events (see below) |
 | `pubkey` | Public key of the events to delete (only your own pubkey can be used) |
 | `createdAt` | Only for `targetType=1`. Creation time (seconds) of the event to delete |
 | `contentHash` | Only for `targetType=1`. SHA-256 (32 bytes) of the event's `content` to delete |
+| `eventId` | Only for `targetType=2`. Event ID (32 bytes) of the full-event-signed event to delete |
 | `signature` | ECDSA signature (64 bytes) of the above "signed data" made with the author's private key |
 
 Values of `targetType`:
@@ -202,6 +268,7 @@ Values of `targetType`:
 |-------|----------|---------------|
 | `0` | `DelTargetPubkey` | All events of that public key, within the given `transType` |
 | `1` | `DelTargetEvent` | The specific event whose `createdAt` and `contentHash` match |
+| `2` | `DelTargetEventId` | The specific event whose `eventId` matches (recommended for full-event-signed events) |
 
 The server verifies the signature and deletes **only events whose public key
 matches the one in the request** — i.e., only the author can delete their own posts.
@@ -254,7 +321,7 @@ startup and converted to encrypted form (log:
 
 LMDB keys use the append-style format `evt_<current time>_<transType>_<random>`.
 Since the server never interprets `content`, events are stored as-is in a
-per-type database (json / string / binary).
+per-type database (json / string / binary / signed / encrypted).
 
 The LMDB map size (the upper bound for stored data) defaults to **256 MB**.
 When the limit is reached, writes start to fail, so set a large enough value via
@@ -266,8 +333,9 @@ machine it is safer not to set it much larger than the physical memory.
 
 - Posting, subscribing, and deleting all work over plain `ws://` as well.
   For production use, **wss://** (terminate TLS with a reverse proxy etc.) is recommended
-- Delete requests require a signature, but subscribing and viewing are open —
-  this relay is intended to operate as a public relay
+- Subscribing to and viewing **public** events is open — this relay is intended
+  to operate as a public relay. Subscribing to **recipient-limited** events
+  (`to:` tag) requires AUTH (read authentication)
 - LMDB files are encrypted, but like any encryption software, plaintext may
   transiently exist in OS memory or swap
 
